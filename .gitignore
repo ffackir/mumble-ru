@@ -1,0 +1,15 @@
+.venv/
+models/
+test-data/
+__pycache__/
+*.py[cod]
+*.pdb
+*.lib
+*.a
+*.dll
+*.mumble_plugin
+*.zip
+.env
+.env.*
+settings.json
+logs/
