@@ -42,6 +42,29 @@ class FixtureCase(unittest.TestCase):
         with path.open('ab') as file: file.write(text.encode('utf-16-le'))
 
 class WatcherTests(FixtureCase):
+    def test_history_is_bounded_deduplicated_and_separate_from_live_tail(self):
+        contents = ''.join(line(f'History {i}') for i in range(120))
+        a = self.log(listener='Pilot A', messages=contents)
+        self.log(name='Fleet_20261104_000000_2.txt', listener='Pilot B', messages=contents)
+        self.log(name='Local_20261104_000000_1.txt', channel='local', messages=line('Private other channel'))
+        watcher = ChatWatcher(self.folder, since=SINCE)
+        self.assertEqual(watcher.poll(), [])
+        history = watcher.read_history({'fleet'})
+        self.assertEqual(set(history), {'fleet'})
+        self.assertEqual(len(history['fleet']), 100)
+        self.assertEqual(len(set(history['fleet'])), 100)
+        self.assertEqual(watcher.poll(), [])
+        self.append(a, line('Live after history'))
+        self.assertEqual([m.text for m in watcher.poll()], ['Live after history'])
+
+    def test_touched_old_log_does_not_replace_current_session_history(self):
+        old = self.log(messages=line('Old session'))
+        self.log(name='Fleet_20261104_003500_1.txt', messages=line('Current session'))
+        os.utime(old, (time.time() + 60, time.time() + 60))
+        watcher = ChatWatcher(self.folder, since=SINCE)
+        watcher.poll()
+        self.assertEqual([m.text for m in watcher.read_history({'fleet'})['fleet']], ['Current session'])
+
     def test_existing_history_is_skipped_and_new_message_is_read_once(self):
         path = self.log(messages=line('Old message'))
         watcher = ChatWatcher(self.folder, since=SINCE)
@@ -106,6 +129,60 @@ class WatcherTests(FixtureCase):
         self.assertEqual([m.text for m in watcher.poll()], ['Hello'])
 
 class PanelTests(FixtureCase):
+    def test_history_selects_freshest_selected_chat_without_sound_or_translation(self):
+        from chat_panel import ChatPanel
+        self.log(messages=line('Older fleet history', stamp='2026.11.03 20:00:00'))
+        self.log(name='Local_20261104_000000_1.txt', channel='local',
+                 messages=line('Fresh local history', stamp='2026.11.03 21:00:00'))
+        root = tk.Tk(); root.withdraw()
+        stopped = threading.Event()
+        with patch('chat_panel.TextTranslator.translate') as translate, patch('chat_panel.play_alert') as sound:
+            panel = ChatPanel(root, {'chat_folder': str(self.folder), 'chat_channels': ['fleet', 'local']}, stopped)
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not panel.latest_activity:
+                    root.update(); time.sleep(.02)
+                self.assertEqual(panel.active_channel(), 'local')
+                shown = panel.tabs['local'][1].get('1.0', 'end')
+                self.assertIn('Fresh local history', shown)
+                self.assertIn('Открыто', shown)
+                self.assertNotIn('Older fleet history', shown)
+                self.assertFalse(any(panel.unread.values()))
+                translate.assert_not_called(); sound.assert_not_called()
+                panel.notebook.select(panel.tabs['fleet'][0]); panel.tab_changed()
+                panel.select_current_chat()
+                self.assertEqual(panel.active_channel(), 'local')
+            finally:
+                stopped.set(); panel.stop(); root.destroy()
+
+    def test_hidden_active_chat_stays_unread_until_visible_at_bottom(self):
+        from chat_panel import ChatPanel
+        from eve_chat import ChatMessage
+        root = tk.Tk(); root.withdraw()
+        stopped = threading.Event()
+        panel = ChatPanel(root, {'chat_folder': str(self.folder), 'chat_channels': ['fleet']}, stopped)
+        try:
+            message = ChatMessage('fleet', 'Fleet', panel.opened_stamp, 'Pilot', 'New incoming text')
+            panel.post(('caption', panel.revision, message, 'Новый текст'))
+            panel.drain()
+            self.assertEqual(panel.unread['fleet'], 1)
+            text = panel.tabs['fleet'][1]
+            self.assertIn('Новые сообщения', text.get('1.0', 'end'))
+            self.assertTrue(text.tag_ranges('unread'))
+            panel.tab_changed()
+            self.assertEqual(panel.unread['fleet'], 1, 'Hidden tab is not read')
+            with patch.object(panel, 'is_reading', return_value=False): panel.mark_visible_read()
+            self.assertEqual(panel.unread['fleet'], 1, 'Scrolling history must not read new messages')
+            with patch.object(panel, 'is_reading', return_value=True): panel.mark_visible_read()
+            self.assertEqual(panel.unread['fleet'], 0)
+            self.assertFalse(text.tag_ranges('unread'))
+            panel.post(('caption', panel.revision, message, 'Обновлённый перевод'))
+            panel.drain()
+            self.assertEqual(len(panel.channel_history['fleet']), 1)
+            self.assertEqual(panel.unread['fleet'], 0, 'Translation update is not a second message')
+        finally:
+            stopped.set(); panel.stop(); root.destroy()
+
     def test_selected_message_translation_does_not_need_a_reply(self):
         from chat_panel import ChatPanel
         root = tk.Tk(); root.withdraw()
@@ -114,7 +191,7 @@ class PanelTests(FixtureCase):
         try:
             panel.notebook.select(panel.tabs['fleet'][0]); panel.tab_changed()
             text = panel.tabs['fleet'][1]
-            text.configure(state='normal'); text.insert('1.0', '你好朋友')
+            text.configure(state='normal'); text.delete('1.0', 'end'); text.insert('1.0', '你好朋友')
             text.tag_add('sel', '1.0', '1.end'); text.configure(state='disabled')
             with patch('chat_panel.TextTranslator.translate', return_value='Привет, друг') as translator:
                 panel.open_message_translation()
@@ -138,7 +215,7 @@ class PanelTests(FixtureCase):
             panel.open_reply()
             self.assertIsNone(panel.reply_dialog)
             text = panel.tabs['fleet'][1]
-            text.configure(state='normal'); text.insert('1.0', 'Hello, fleet!')
+            text.configure(state='normal'); text.delete('1.0', 'end'); text.insert('1.0', 'Hello, fleet!')
             text.tag_add('sel', '1.0', '1.end'); text.configure(state='disabled')
             with patch('chat_panel.TextTranslator.translate', return_value='Привет, флот!'):
                 panel.open_reply()
@@ -325,7 +402,8 @@ class PanelTests(FixtureCase):
                 self.assertIn('Привет', panel.tabs['local'][1].get('1.0', 'end'))
                 self.assertEqual(panel.unread['local'], 1)
                 self.assertEqual(panel.active_channel(), 'fleet')
-                panel.notebook.select(panel.tabs['local'][0]); panel.tab_changed()
+                panel.notebook.select(panel.tabs['local'][0])
+                with patch.object(panel, 'is_reading', return_value=True): panel.tab_changed()
                 self.assertEqual(panel.unread['local'], 0)
                 self.assertTrue(panel.preferences()['chat_sound_enabled'])
                 self.assertEqual(panel.preferences()['chat_filter_words'], ['warp'])

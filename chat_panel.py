@@ -1,6 +1,7 @@
 """Independent text-chat UI and workers; no Whisper or Mumble needed."""
 from collections import deque, OrderedDict
 from pathlib import Path
+from datetime import datetime, timezone
 import queue
 import threading
 import time
@@ -60,6 +61,13 @@ class ChatPanel:
         self.channel_history = {}
         self.tabs = {}
         self.unread = {}
+        self.unread_messages = {}
+        self.unread_boundary = {}
+        self.opened_at = datetime.now(timezone.utc).replace(microsecond=0)
+        self.opened_stamp = self.opened_at.strftime('%Y.%m.%d %H:%M:%S')
+        self.latest_activity = {}
+        self.pick_current = True
+        self.parent.bind('<FocusIn>', lambda event: self.parent.after_idle(self.mark_visible_read), add='+')
         self.frame = tk.Frame(parent, bg=BG)
         self.frame.pack(fill='both', expand=True, padx=18, pady=(10, 4))
         bar = tk.Frame(self.frame, bg=BG)
@@ -68,7 +76,7 @@ class ChatPanel:
         tk.Checkbutton(bar, text='Чаты EVE → русский', variable=self.enabled_var,
             command=self.toggle, fg=FG, bg=BG, selectcolor='#182833',
             activebackground=BG, activeforeground=FG, font=('Segoe UI', 11, 'bold')).pack(side='left')
-        for label, callback in (('Настройки…', self.open_settings), ('Папка…', self.choose_folder), ('Выбрать чаты…', self.choose_channels)):
+        for label, callback in (('Актуальный чат', self.select_current_chat), ('Настройки…', self.open_settings), ('Папка…', self.choose_folder), ('Выбрать чаты…', self.choose_channels)):
             tk.Button(bar, text=label, command=callback, fg=FG, bg='#182833',
                 activebackground='#263e4c', activeforeground=FG, relief='flat').pack(side='right', padx=(6, 0))
         self.selection_label = tk.StringVar()
@@ -83,7 +91,7 @@ class ChatPanel:
         tk.Button(location_bar, text='Исходная система…', command=self.open_origin_settings,
                   bg='#182833', fg=FG, relief='flat').pack(side='right')
         self.update_origin_label()
-        self.status = tk.StringVar(value='Ищу чат-логи EVE. Переводится только новая переписка…')
+        self.status = tk.StringVar(value='Ищу актуальные журналы и загружаю историю чатов…')
         tk.Label(self.frame, textvariable=self.status, bg=BG, fg=MUTED,
                  font=('Segoe UI', 9), anchor='w', wraplength=680).pack(fill='x', pady=(4, 6))
         area = tk.Frame(self.frame, bg=BG)
@@ -109,7 +117,7 @@ class ChatPanel:
         if active_tab in self.tabs:
             self.notebook.select(self.tabs[active_tab][0])
             self.tab_changed()
-        self.post(('status', 'Ожидаю новые сообщения. Старые логи не переводятся.'))
+        self.post(('status', 'История загружается; новые сообщения отмечаются со времени открытия.'))
         self.watcher_thread = threading.Thread(target=self.watch, daemon=True)
         self.translation_thread = threading.Thread(target=self.translate, daemon=True)
         self.watcher_thread.start()
@@ -124,11 +132,17 @@ class ChatPanel:
             state='disabled', selectbackground='#284754')
         scrollbar = tk.Scrollbar(frame, command=text.yview)
         scrollbar.pack(side='right', fill='y')
-        text.configure(yscrollcommand=scrollbar.set)
+        def scrolled(first, last):
+            scrollbar.set(first, last)
+            if float(last) >= .98:
+                self.parent.after_idle(self.mark_visible_read)
+        text.configure(yscrollcommand=scrolled)
         text.pack(side='left', fill='both', expand=True)
         text.tag_configure('meta', foreground=ACCENT, font=('Segoe UI', 9, 'bold'))
         text.tag_configure('original', foreground=MUTED, font=('Segoe UI', 9))
         text.tag_configure('translated', foreground=FG)
+        text.tag_configure('boundary', foreground='#edc780', font=('Segoe UI', 10, 'bold'), spacing1=8, spacing3=8)
+        text.tag_configure('unread', background='#203442')
         text.tag_configure('match', foreground='#edc780', font=('Segoe UI', 9, 'bold'))
         menu = tk.Menu(text, tearoff=False)
         menu.add_command(label='Перевести выделенное на русский', command=lambda: self.open_message_translation(text))
@@ -149,6 +163,8 @@ class ChatPanel:
                 self.channel_history.pop(channel_id, None)
                 self.route_buttons.pop(channel_id, None)
                 self.unread.pop(channel_id, None)
+                self.unread_messages.pop(channel_id, None)
+                self.unread_boundary.pop(channel_id, None)
         for channel_id in sorted(self.selected, key=lambda key: names.get(key, key).casefold()):
             if channel_id not in self.tabs:
                 frame = tk.Frame(self.notebook, bg=BG)
@@ -178,6 +194,7 @@ class ChatPanel:
                 self.tabs[channel_id] = (frame, text)
                 self.channel_history[channel_id] = deque(maxlen=100)
                 self.notebook.add(frame, text=names.get(channel_id, channel_id))
+                self.render_history(channel_id)
             self.chat_labels[channel_id].configure(text=names.get(channel_id, channel_id))
             self.update_tab_title(channel_id)
         if self.tabs:
@@ -220,12 +237,38 @@ class ChatPanel:
         self.status.set(f'{name}: перевод включён.' if enabled else f'{name}: показ оригинала, перевод выключен.')
         if self.on_preferences_changed: self.on_preferences_changed()
 
+    def is_reading(self, channel_id):
+        if self.active_channel() != channel_id or channel_id not in self.tabs: return False
+        try:
+            focus = self.parent.focus_displayof()
+            return (self.parent.winfo_viewable() and focus is not None and
+                    focus.winfo_toplevel() == self.parent.winfo_toplevel() and
+                    self.tabs[channel_id][1].yview()[1] >= .98)
+        except tk.TclError:
+            return False
+
+    def mark_visible_read(self):
+        channel_id = self.active_channel()
+        if channel_id and self.is_reading(channel_id):
+            self.unread_messages.setdefault(channel_id, set()).clear()
+            self.unread[channel_id] = 0
+            self.update_tab_title(channel_id)
+            self.tabs[channel_id][1].tag_remove('unread', '1.0', 'end')
+
     def tab_changed(self, event=None):
         channel_id = self.active_channel()
         self.text = self.tabs[channel_id][1] if channel_id in self.tabs else None
         if channel_id:
-            self.unread[channel_id] = 0
+            self.mark_visible_read()
             self.update_tab_title(channel_id)
+
+    def select_current_chat(self):
+        choices = [key for key in self.tabs if key in self.latest_activity]
+        if choices:
+            key = max(choices, key=lambda item: self.latest_activity[item])
+            self.notebook.select(self.tabs[key][0])
+            self.tab_changed()
+            self.status.set('Открыт выбранный канал с самым свежим сообщением в журнале.')
 
     def snapshot(self):
         with self.state_lock:
@@ -615,7 +658,15 @@ class ChatPanel:
             with self.state_lock:
                 self.folder = Path(folder)
                 self.revision += 1
-            self.status.set('Папка изменена. Отслеживаю только новые сообщения…')
+            self.pick_current = True
+            self.latest_activity.clear()
+            self.unread_messages.clear()
+            self.unread_boundary.clear()
+            self.unread.clear()
+            self.history.clear()
+            for key in self.channel_history: self.channel_history[key].clear()
+            self.render_history()
+            self.status.set('Папка изменена. Загружаю историю актуальных сессий…')
 
     def choose_channels(self):
         dialog = tk.Toplevel(self.parent)
@@ -647,6 +698,7 @@ class ChatPanel:
             with self.state_lock:
                 self.selected = selected
                 self.revision += 1
+            self.pick_current = True
             self.history.clear()
             self.sync_tabs()
             self.update_selection_label()
@@ -675,8 +727,13 @@ class ChatPanel:
         missing = None
         tracker = LocationTracker(self.catalog)
         old_locations = None
+        loaded_channels = set()
+        loaded_revision = None
         while not self.stopped.is_set():
             folder, selected, active, revision = self.snapshot()
+            if revision != loaded_revision:
+                loaded_channels.clear()
+                loaded_revision = revision
             if folder != current_folder:
                 watcher = ChatWatcher(folder)
                 current_folder = folder
@@ -684,6 +741,7 @@ class ChatPanel:
                 missing = None
                 tracker = LocationTracker(self.catalog)
                 old_locations = None
+                loaded_channels = set()
             exists = folder.is_dir()
             if not exists:
                 if missing is not True:
@@ -704,6 +762,12 @@ class ChatPanel:
                     self.post(('status', f'Найдено каналов: {len(channels)}. Ожидаю новые сообщения…' if channels else
                                'Логи ещё не найдены. Включите запись чата в файлы в EVE и откройте канал.'))
                 missing = False
+                new_channels = set(selected) - loaded_channels
+                if new_channels:
+                    history = watcher.read_history(new_channels)
+                    self.post(('history', revision, folder, history, self.opened_stamp))
+                loaded_channels.intersection_update(selected)
+                loaded_channels.update(new_channels.intersection(watcher.channels))
                 for message in records:
                     # Re-read selection after disk access: pause is immediate for queued jobs.
                     _, selected, active, revision = self.snapshot()
@@ -794,6 +858,30 @@ class ChatPanel:
             elif event[0] == 'route_result':
                 if event[1] == self.route_generation and self.route_dialog is not None and self.route_dialog.winfo_exists():
                     self.route_result.set(event[2])
+            elif event[0] == 'history':
+                _, revision, folder, histories, _ = event
+                if folder != self.folder or revision != self.revision: continue
+                for key, messages in histories.items():
+                    if key not in self.tabs: continue
+                    existing = dict(self.channel_history.get(key, ()))
+                    for message in messages:
+                        if (message not in existing and message.timestamp > self.opened_stamp
+                                and not self.is_reading(key)):
+                            unread = self.unread_messages.setdefault(key, set())
+                            if not unread: self.unread_boundary[key] = message
+                            unread.add(message)
+                        existing.setdefault(message, message.text)
+                    ordered = sorted(existing.items(), key=lambda item: item[0].timestamp)[-100:]
+                    self.channel_history[key] = deque(ordered, maxlen=100)
+                    unread = self.unread_messages.setdefault(key, set())
+                    unread.intersection_update(message for message, _ in ordered)
+                    self.unread[key] = len(unread)
+                    self.update_tab_title(key)
+                    if ordered: self.latest_activity[key] = ordered[-1][0].timestamp
+                    self.render_history(key)
+                if self.pick_current and self.latest_activity:
+                    self.pick_current = False
+                    self.select_current_chat()
             elif event[0] == 'channels':
                 self.available = event[1]
                 self.sync_tabs()
@@ -805,15 +893,30 @@ class ChatPanel:
                     self.register_nearby_message(event[2])
             elif event[0] == 'caption':
                 _, _, active, revision = self.snapshot()
-                if not active or revision != event[1]: continue
+                if not active or revision != event[1] or event[2].channel_id not in self.selected: continue
                 message, translated = event[2:4]
                 if len(event) > 4 and event[4] != self.channel_state(message.channel_id)[1]: continue
                 self.alert_for(message, translated)
                 self.register_nearby_message(message)
-                self.history.append((message, translated))
-                self.channel_history.setdefault(message.channel_id, deque(maxlen=100)).append((message, translated))
-                if self.active_channel() != message.channel_id:
-                    self.unread[message.channel_id] = self.unread.get(message.channel_id, 0) + 1
+                self.latest_activity[message.channel_id] = message.timestamp
+                if self.pick_current:
+                    self.pick_current = False
+                    self.select_current_chat()
+                values = self.channel_history.setdefault(message.channel_id, deque(maxlen=100))
+                existed = any(previous == message for previous, _ in values)
+                if existed:
+                    values = deque(((previous, translated if previous == message else value)
+                                    for previous, value in values), maxlen=100)
+                    self.channel_history[message.channel_id] = values
+                else:
+                    self.history.append((message, translated))
+                    values.append((message, translated))
+                if not existed and not self.is_reading(message.channel_id):
+                    unread = self.unread_messages.setdefault(message.channel_id, set())
+                    if not unread: self.unread_boundary[message.channel_id] = message
+                    unread.add(message)
+                    unread.intersection_update(previous for previous, _ in values)
+                    self.unread[message.channel_id] = len(unread)
                     self.update_tab_title(message.channel_id)
                 self.render_history(message.channel_id)
                 if not translated.startswith('[оригинал]') and self.channel_state(message.channel_id)[0]:
@@ -839,7 +942,14 @@ class ChatPanel:
         for button in self.route_buttons.get(channel_id, []): button.destroy()
         self.route_buttons[channel_id] = buttons = []
         text.delete('1.0', 'end')
+        opening_marked = False
         for message, translated in self.channel_history.get(channel_id, ()):
+            if not opening_marked and message.timestamp >= self.opened_stamp:
+                text.insert('end', f'── Открыто {self.opened_stamp} UTC ──\n', 'boundary')
+                opening_marked = True
+            if message == self.unread_boundary.get(channel_id):
+                text.insert('end', '── Новые сообщения ──\n', 'boundary')
+            row_start = text.index('end-1c')
             seen = set()
             matched = self.alerts.matches(message.text) or self.alerts.matches(translated)
             text.insert('end', f'{"[!] " if matched else ""}{message.timestamp[-8:]} UTC · {message.channel} · {message.author}\n', 'match' if matched else 'meta')
@@ -847,6 +957,10 @@ class ChatPanel:
             if translated != message.text and not translated.startswith('[оригинал]'):
                 self.insert_system_buttons(text, message.text + '\n', 'original', seen, buttons)
             text.insert('end', '\n')
+            if message in self.unread_messages.get(channel_id, ()):
+                text.tag_add('unread', row_start, 'end-1c')
+        if not opening_marked:
+            text.insert('end', f'── Открыто {self.opened_stamp} UTC · ожидание новых сообщений ──\n', 'boundary')
         text.configure(state='disabled')
         if at_bottom: text.see('end')
         else: text.yview_moveto(old_scroll)

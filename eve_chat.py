@@ -1,4 +1,4 @@
-"""Read new EVE chat-log lines only. Never modify files or interact with EVE."""
+"""Read EVE chat history and new lines. Never modify files or interact with EVE."""
 import codecs
 import ctypes
 from collections import OrderedDict
@@ -49,6 +49,38 @@ class ChatWatcher:
         self.channels = {}
         self.seen = OrderedDict()
         self.primed = False
+        self.latest = {}
+
+    def read_history(self, selected, limit=100):
+        """Bounded snapshot from the latest sessions, separate from the live tail."""
+        messages = {}
+        for path, metadata in self.latest.items():
+            channel_id, channel, _, encoding = metadata
+            if channel_id not in selected: continue
+            try:
+                with path.open('rb') as source:
+                    source.seek(0, 2)
+                    start = max(0, source.tell() - 262144)
+                    if encoding.startswith('utf-16'): start -= start % 2
+                    source.seek(start)
+                    content = source.read(262144).decode(encoding, errors='replace')
+                lines = content.split('\n')[:-1]  # Exclude an unfinished last line.
+                if start and lines: lines.pop(0)
+                for line in lines:
+                    match = MESSAGE.match(line.strip('\ufeff\r'))
+                    if not match: continue
+                    timestamp, author, text = match.groups()
+                    try: datetime.strptime(timestamp, '%Y.%m.%d %H:%M:%S')
+                    except ValueError: continue
+                    if not author.strip() or not text.strip() or author.casefold() in ('eve system', 'система eve'): continue
+                    message = ChatMessage(channel_id, channel, timestamp, author, text)
+                    messages[message] = None
+            except (OSError, UnicodeError):
+                continue
+        result = {}
+        for message in sorted(messages, key=lambda m: (m.timestamp, m.author, m.text)):
+            result.setdefault(message.channel_id, []).append(message)
+        return {key: values[-limit:] for key, values in result.items()}
 
     def _metadata(self, path, stat):
         identity = (stat.st_dev, stat.st_ino)
@@ -88,7 +120,9 @@ class ChatWatcher:
                 if not metadata: continue
                 channel_id, channel, listener, encoding = metadata
                 key = (channel_id, listener)
-                rank = (stat.st_mtime_ns, path.name)
+                # A recently touched old log must not replace a newer session.
+                session = re.search(r'_(\d{8}_\d{6})(?:_\d+)?$', path.stem)
+                rank = (session.group(1) if session else '', stat.st_mtime_ns, path.name)
                 if key not in candidates or rank > candidates[key][0]:
                     candidates[key] = (rank, path, stat, metadata)
                 if channel_id not in channel_ranks or rank > channel_ranks[channel_id]:
@@ -97,6 +131,7 @@ class ChatWatcher:
             except (OSError, UnicodeError):
                 continue
         self.channels = channels
+        self.latest = {path: metadata for _, path, _, metadata in candidates.values()}
         ready = []
         active_paths = set()
         for _, path, stat, metadata in candidates.values():
