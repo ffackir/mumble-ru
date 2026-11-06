@@ -283,6 +283,34 @@ class PanelTests(FixtureCase):
         finally:
             stopped.set(); panel.stop(); root.destroy()
 
+    def test_geographic_alerts_follow_pilot_after_jump(self):
+        from chat_panel import ChatPanel
+        from eve_chat import ChatMessage
+        from eve_routes import PlayerLocation
+
+        root = tk.Tk()
+        root.withdraw()
+        stopped = threading.Event()
+        panel = ChatPanel(root, {
+            'chat_folder': str(self.folder), 'chat_channels': ['fleet'],
+            'chat_filter_words': ['enemy'], 'route_pilot': 'Pilot',
+        }, stopped)
+        try:
+            message = ChatMessage('fleet', 'Fleet', '2026.11.04 01:00:00', 'FC', 'enemy 4-HWWF')
+            panel.locations = [PlayerLocation('Pilot', 30000142, 'Jita', message.timestamp)]
+            with patch('chat_panel.play_alert') as sound:
+                panel.alert_for(message)
+                panel.register_nearby_message(message)
+                sound.assert_not_called()
+
+                panel.locations = [PlayerLocation('Pilot', 30000240, '4-HWWF', message.timestamp)]
+                panel.register_nearby_message(message)
+                sound.assert_called_once()
+        finally:
+            stopped.set()
+            panel.stop()
+            root.destroy()
+
     def test_per_chat_sound_toggle_is_independent(self):
         from chat_panel import ChatPanel
         from eve_chat import ChatMessage

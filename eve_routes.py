@@ -38,6 +38,28 @@ class SystemCatalog:
 def default_catalog():
     return SystemCatalog()
 
+@lru_cache(maxsize=1)
+def stargate_graph():
+    path = Path(__file__).parent / 'assets' / 'stargate_graph.json'
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@lru_cache(maxsize=128)
+def nearby_gate_distances(origin):
+    distances = {origin: 0}
+    frontier = [origin]
+    graph = stargate_graph()
+    for jumps in range(1, 4):
+        next_frontier = []
+        for system in frontier:
+            for neighbor in graph.get(str(system), ()):
+                if neighbor not in distances:
+                    distances[neighbor] = jumps
+                    next_frontier.append(neighbor)
+        frontier = next_frontier
+    return distances
+
+
 @dataclass(frozen=True)
 class PlayerLocation:
     pilot: str
@@ -89,8 +111,7 @@ class LocationTracker:
                 changed = LOCAL_CHANGE.search(body)
                 if not changed: continue
                 system = self.catalog.resolve(changed.group(1))
-                if system:
-                    state['location'] = PlayerLocation(pilot, system[0], system[1], timestamp)
+                state['location'] = PlayerLocation(pilot, system[0], system[1], timestamp) if system else None
             if state['offset'] >= stat.st_size and state['location']:
                 locations.append(state['location'])
         self.files = {path: state for path, state in self.files.items() if path in active_paths}

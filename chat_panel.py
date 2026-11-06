@@ -11,7 +11,7 @@ from tkinter import filedialog, ttk
 from eve_chat import ChatWatcher, default_chat_folder
 from translator import TextTranslator, translate_reply
 from alerts import WordAlerts, parse_words, play_alert
-from eve_routes import default_catalog, LocationTracker, RouteClient
+from eve_routes import default_catalog, LocationTracker, RouteClient, nearby_gate_distances
 from system_entry import SystemEntry
 
 BG, FG, MUTED, ACCENT = '#0b1015', '#edf3f6', '#b2c1cb', '#82c8e8'
@@ -50,7 +50,6 @@ class ChatPanel:
         self.inline_counts = OrderedDict()
         self.route_pending = set()
         self.route_jobs = queue.Queue(maxsize=100)
-        self.nearby_waiters = OrderedDict()
         self.nearby_enabled = bool(config.get('chat_nearby_sound', True))
         self.background_transparency = max(0, min(65, int(config.get('background_transparency', 15))))
         self.clear_background = bool(config.get('clear_chat_background', False))
@@ -547,14 +546,9 @@ class ChatPanel:
     def register_nearby_message(self, message):
         origin = self.current_origin()
         if not origin or not self.nearby_enabled: return
+        distances = nearby_gate_distances(origin[0])
         for destination in {item[2] for item in self.catalog.mentions(message.text)}:
-            key = (origin[0], destination)
-            cached = self.request_inline(key)
-            if cached is not None:
-                self.nearby_alert(key, message, cached[1])
-            else:
-                self.nearby_waiters[(key, self.message_key(message))] = message
-                if len(self.nearby_waiters) > 512: self.nearby_waiters.popitem(last=False)
+            self.nearby_alert((origin[0], destination), message, distances.get(destination))
 
     def open_origin_settings(self):
         dialog = tk.Toplevel(self.parent)
@@ -637,7 +631,10 @@ class ChatPanel:
 
     def alert_for(self, message, translated=''):
         if message.channel_id in self.muted_channels: return
-        key = (message.channel_id, message.timestamp, message.author, message.text)
+        if self.nearby_enabled and any(self.catalog.mentions(message.text)):
+            # System reports use the geographic alert path, even if a keyword matches.
+            return
+        key = self.message_key(message)
         if self.alerts.should_play(key, message.text) or self.alerts.should_play(key, translated):
             play_alert()
 
@@ -850,10 +847,6 @@ class ChatPanel:
                 self.route_pending.discard(key)
                 self.inline_counts[key] = (time.monotonic(), count, error)
                 if len(self.inline_counts) > 400: self.inline_counts.popitem(last=False)
-                for waiter, message in list(self.nearby_waiters.items()):
-                    if waiter[0] == key:
-                        self.nearby_alert(key, message, count)
-                        self.nearby_waiters.pop(waiter, None)
                 self.refresh_route_buttons()
             elif event[0] == 'route_result':
                 if event[1] == self.route_generation and self.route_dialog is not None and self.route_dialog.winfo_exists():
